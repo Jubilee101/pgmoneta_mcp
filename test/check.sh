@@ -17,54 +17,110 @@ set -euo pipefail
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PGMONETA_DIR="$HOME/.pgmoneta"
-readonly MASTER_KEY_FILE="$PGMONETA_DIR/master.key"
+readonly PGMONETA_MCP_DIR="$HOME/.pgmoneta-mcp"
+readonly PGMONETA_MASTER_KEY_FILE="$PGMONETA_DIR/master.key"
+readonly MCP_MASTER_KEY_FILE="$PGMONETA_MCP_DIR/master.key"
 readonly TEST_SUITE_DIR_NAME="test-suite"
 readonly TEST_SUITE_DIR="$SCRIPT_DIR/$TEST_SUITE_DIR_NAME"
 readonly TEST_MASTER_KEY="$TEST_SUITE_DIR/master.key"
+readonly CONF_FILES="$TEST_SUITE_DIR/conf"
+readonly BIN_DIR="$TEST_SUITE_DIR/usr/bin"
+readonly PGMONETA_RUN_FILE="$BIN_DIR/run-pgmoneta.ci"
+readonly POSTGRESQL_RUN_FILE="$BIN_DIR/run-postgresql.ci"
+readonly MANAGEMENT_PORT=5002
+readonly PGMONETA_PORT_ONE=5001
+readonly PGMONETA_PORT_TWO=9100
+readonly POSTGRESQL_PORT=5432
 
-setup_master_key() {
-    if [[ ! -f "$MASTER_KEY_FILE" ]]; then
-        echo "Generating new master key..."
-        pgmoneta-admin -g master-key
-    else 
-        echo "Master key already exists, skipping generation."
-    fi
-    chmod 700 "$PGMONETA_DIR"
-    chmod 600 "$MASTER_KEY_FILE"
-}
+MASTER_KEY_PATH=
+IMAGE_REF=
+RUN_REPLACE_FLAG=
+GENERATE_NEW_IMAGE=false
+POSTGRES_PID=
+PGMONETA_PID=
 
-copy_master_key() {
-    echo "Copying master key to test suite directory..."
-    cat "$MASTER_KEY_FILE" > "$TEST_MASTER_KEY"
-}
+readonly CONTAINER_NAME="pgmoneta-container"
+readonly IMAGE_NAME="pgmoneta-mcp-test-suite"
 
-build_test_suite() {
-    echo "Building test suite container..."
-    cd "$TEST_SUITE_DIR"
-    make build
-    cd "$SCRIPT_DIR"
-}
+## Env vars
+export PG_DATABASE=${PG_DATABASE:-"mydb"}
+export PG_DATABASE_ENCODING=${PG_DATABASE_ENCODING:-UTF8}
+export PG_USER_NAME=${PG_USER_NAME:-"myuser"}
+export PG_USER_PASSWORD=${PG_USER_PASSWORD:-"mypass"}
+export PG_NETWORK_MASK=${PG_NETWORK_MASK:-"all"}
+export PG_PRIMARY_NAME=${PG_PRIMARY_NAME:-"localhost"}
+export PG_PRIMARY_PORT=${PG_PRIMARY_PORT:-"5432"}
+export PG_REPL_USER_NAME=${PG_REPL_USER_NAME:-"backup_user"}
+export PG_REPL_USER_PASSWORD=${PG_REPL_USER_PASSWORD:-"backup_pass"}
 
-check_port() {
-    local port="$1"
-    if nc -z localhost "$port" 2>/dev/null; then
-        echo "Error: Port $port is already in use. Stop the process using it or change the port configuration in Makefile and tests."
-        exit 1
-    fi
-}
-
-check_container_exists() {
-    local container_engine=""
-    local container_name="pgmoneta-container"
-    
+## ================================
+## Container operations
+## ================================
+get_container_engine() {
     if command -v podman >/dev/null 2>&1; then
-        container_engine="podman"
+        echo "podman"
     elif command -v docker >/dev/null 2>&1; then
-        container_engine="docker"
+        echo "docker"
     else
         echo "Error: Neither Docker nor Podman is installed" >&2
         exit 1
     fi
+}
+
+get_image_name() {
+    local container_engine="$(get_container_engine)"
+
+    if [[ "$container_engine" == "docker" ]]; then
+        IMAGE_REF="docker.io/library/$IMAGE_NAME"
+        RUN_REPLACE_FLAG=""
+    else
+        IMAGE_REF="localhost/$IMAGE_NAME"
+        RUN_REPLACE_FLAG="--replace"
+    fi
+}
+
+start_container() {
+    local container_engine="$(get_container_engine)"
+    $container_engine run -p $MANAGEMENT_PORT:$MANAGEMENT_PORT -p $PGMONETA_PORT_ONE:$PGMONETA_PORT_ONE -p $PGMONETA_PORT_TWO:$PGMONETA_PORT_TWO -p $POSTGRESQL_PORT:$POSTGRESQL_PORT --name "$CONTAINER_NAME" -d -e PG_DATABASE="$PG_DATABASE" -e PG_USER_NAME="$PG_USER_NAME" -e PG_USER_PASSWORD="$PG_USER_PASSWORD" -e PG_NETWORK_MASK="$PG_NETWORK_MASK" -e PG_PRIMARY_NAME="$PG_PRIMARY_NAME" -e PG_PRIMARY_PORT="$PG_PRIMARY_PORT" -e PG_REPL_USER_NAME="$PG_REPL_USER_NAME" -e PG_REPL_USER_PASSWORD="$PG_REPL_USER_PASSWORD" "$RUN_REPLACE_FLAG" "$IMAGE_REF"
+}
+
+start_composed_container() {
+    if check_container_exists; then
+        return 0
+    fi
+    echo "Starting composed container for testing..."
+    check_port "$MANAGEMENT_PORT"
+    check_port "$PGMONETA_PORT_ONE"
+    check_port "$PGMONETA_PORT_TWO"
+    check_port "$POSTGRESQL_PORT"
+    cd "$TEST_SUITE_DIR"
+    start_container
+    cd "$SCRIPT_DIR"
+    wait_for_pgmoneta_startup
+}
+
+build_composed_image() {
+    get_image_name
+    local container_engine="$(get_container_engine)"
+    ## check if image name exists, if yes skip build
+    if [[ "$GENERATE_NEW_IMAGE" == false ]] && $container_engine images --format "{{.Repository}}" 2>/dev/null | grep -q "$IMAGE_REF"; then
+        echo "Image '$IMAGE_REF' already exists. Skipping build."
+        return 0
+    fi
+    $container_engine build --no-cache -t "$IMAGE_REF" .
+}
+
+clean_composed_image() {
+    local container_engine="$(get_container_engine)"
+    $container_engine stop "$CONTAINER_NAME" 2>/dev/null || true
+    $container_engine rm -f "$CONTAINER_NAME" 2>/dev/null || true
+    $container_engine rmi -f "$IMAGE_REF" 2>/dev/null || true
+    $container_engine rmi -f "$IMAGE_NAME" 2>/dev/null || true
+}
+
+check_container_exists() {
+    local container_engine="$(get_container_engine)"
+    local container_name="$CONTAINER_NAME"
     
     if $container_engine ps -a --format "{{.Names}}" 2>/dev/null | grep -q "$container_name"; then
         echo "Container '$container_name' already exists."
@@ -83,16 +139,217 @@ check_container_exists() {
     return 1
 }
 
-start_composed_container() {
-    if check_container_exists; then
-        return 0
+stop_composed_container() {
+    local container_engine="$(get_container_engine)"
+    $container_engine stop "$CONTAINER_NAME" 2>/dev/null || true
+}
+
+## ================================
+## Master key operations
+## ================================
+
+# private
+## Master key is needed by the integration tests
+setup_master_key() {
+    if [[ -s "$MCP_MASTER_KEY_FILE" ]]; then
+        echo "MCP master key already exists, skipping generation."
+        chmod 700 "$PGMONETA_MCP_DIR"
+        chmod 600 "$MCP_MASTER_KEY_FILE"
+        MASTER_KEY_PATH="$MCP_MASTER_KEY_FILE"
+    elif [[ -s "$PGMONETA_MASTER_KEY_FILE" ]]; then
+        echo "Master key already exists, skipping generation."
+        chmod 700 "$PGMONETA_DIR"
+        chmod 600 "$PGMONETA_MASTER_KEY_FILE"
+        MASTER_KEY_PATH="$PGMONETA_MASTER_KEY_FILE"
+    else
+        generate_master_key
     fi
-    echo "Starting composed container for testing..."
-    check_port 5432
+}
+
+## Generate the new master key using pgmoneta-admin utility (needs to be executed using non-root user)
+generate_master_key() {
+    mkdir -p "$PGMONETA_DIR"
+    echo "Generating new master key..."
+    chmod 700 "$PGMONETA_DIR"
+    pgmoneta-admin -g master-key
+    chmod 600 "$PGMONETA_MASTER_KEY_FILE"
+    MASTER_KEY_PATH="$PGMONETA_MASTER_KEY_FILE"
+    echo "Master key generated at $MASTER_KEY_PATH"
+    GENERATE_NEW_IMAGE=true # since we have changed the master key.
+}
+
+# private
+copy_master_key() {
+    echo "Copying master key to test suite directory..."
+    if [[ ! "$SUBCOMMAND" == "ci" ]]; then
+        cat "$MASTER_KEY_PATH" > "$TEST_MASTER_KEY"
+    fi
+    mkdir -p "$PGMONETA_MCP_DIR"
+    chmod 700 "$PGMONETA_MCP_DIR"
+    cat "$MASTER_KEY_PATH" > "$MCP_MASTER_KEY_FILE"
+    chmod 600 "$MCP_MASTER_KEY_FILE"
+}
+
+# api
+handle_master_key() {
+    setup_master_key
+    copy_master_key
+}
+## ================================
+## CI operations
+## ================================
+ci_create_pgmoneta_user() {
+    if ! id -u pgmoneta >/dev/null 2>&1; then
+        echo "Creating pgmoneta user and group..."
+        useradd -r -m -d /home/pgmoneta -s /bin/bash pgmoneta
+    else
+        echo "pgmoneta user already exists, skipping creation."
+    fi
+}
+
+ci_create_postgres_user() {
+    if ! id -u postgres >/dev/null 2>&1; then
+        echo "Creating postgres user and group..."
+        useradd -r -s /bin/bash postgres
+    else
+        echo "postgres user already exists, skipping creation."
+    fi
+}
+
+ci_create_users() {
+    ci_create_pgmoneta_user
+    ci_create_postgres_user
+}
+
+ci_check_postgres_running() {
+    if ! nc -z localhost "$POSTGRESQL_PORT" 2>/dev/null; then
+        echo "Error: PostgreSQL is not running on port $POSTGRESQL_PORT. Please start/install PostgreSQL before running CI tests."
+        exit 1
+    fi
+}
+
+ci_run_postgresql() {
+    echo "Starting PostgreSQL for CI tests..."
+    chmod a+x "$POSTGRESQL_RUN_FILE"
+    "$POSTGRESQL_RUN_FILE" &
+    POSTGRES_PID=$!
+    ci_wait_for_postgresql
+}
+
+ci_wait_for_postgresql() {
+    local max_wait=30
+    local count=0
+
+    until nc -z localhost $POSTGRESQL_PORT; do
+        if [ "$count" -ge "$max_wait" ]; then
+            echo "PostgreSQL did not become ready within ${max_wait}s"
+            exit 1
+        fi
+
+        echo "Waiting for PostgreSQL..."
+        sleep 1
+        count=$((count + 1))
+    done
+}
+
+ci_run_pgmoneta() {
+    echo "Starting pgmoneta for CI tests..."
+    chmod a+x "$PGMONETA_RUN_FILE"
+    "$PGMONETA_RUN_FILE" &
+    PGMONETA_PID=$!
+    ci_wait_for_pgmoneta
+}
+
+ci_wait_for_pgmoneta() {
+    local max_wait=30
+    local count=0
+
+    until nc -z localhost $MANAGEMENT_PORT; do
+        if [ "$count" -ge "$max_wait" ]; then
+            echo "pgmoneta did not become ready within ${max_wait}s"
+            exit 1
+        fi
+
+        echo "Waiting for pgmoneta..."
+        sleep 1
+        count=$((count + 1))
+    done
+}
+
+ci_install_utilities() {
+    local arch
+    arch="$(uname -m)"
+    rpm -Uvh "https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm"
+    rpm -Uvh "https://download.postgresql.org/pub/repos/yum/reporpms/EL-10-${arch}/pgdg-redhat-repo-latest.noarch.rpm"
+    dnf update -y
+    dnf install -y cargo nmap-ncat
+    dnf install -y postgresql18 postgresql18-server postgresql18-contrib postgresql18-libs
+    dnf install -y pgmoneta
+}
+
+ci_handle_master_key() {
+    su - pgmoneta <<EOF
+$(declare -f setup_master_key copy_master_key generate_master_key handle_master_key)
+PGMONETA_DIR="\$HOME/.pgmoneta"
+PGMONETA_MCP_DIR="\$HOME/.pgmoneta-mcp"
+PGMONETA_MASTER_KEY_FILE="\$PGMONETA_DIR/master.key"
+MCP_MASTER_KEY_FILE="\$PGMONETA_MCP_DIR/master.key"
+SUBCOMMAND="ci"
+MASTER_KEY_PATH=""
+GENERATE_NEW_IMAGE=false
+handle_master_key
+EOF
+
+    local master_key="/home/pgmoneta/.pgmoneta-mcp/master.key"
+    mkdir -p "$PGMONETA_MCP_DIR"
+    su - pgmoneta -c "cat '$master_key'" > "$MCP_MASTER_KEY_FILE"
+    chmod 700 "$PGMONETA_MCP_DIR"
+    chmod 600 "$MCP_MASTER_KEY_FILE"
+}
+
+ci_setup() {
+    mkdir -p /pgdata /pgwal /pgmoneta /pglog
+    ci_install_utilities
+    ci_create_users
+    ci_handle_master_key
+    cp "$CONF_FILES"/* /tmp/
+    ci_run_postgresql
+    ci_run_pgmoneta
+}
+
+ci_shutdown() {
+    echo "Stopping CI services..."
+    [ -n "${PGMONETA_PID:-}" ] && kill -TERM "$PGMONETA_PID" >/dev/null 2>&1 || true
+    [ -n "${POSTGRES_PID:-}" ] && kill -TERM "$POSTGRES_PID" >/dev/null 2>&1 || true
+    sleep 1
+    [ -n "${PGMONETA_PID:-}" ] && kill -KILL "$PGMONETA_PID" >/dev/null 2>&1 || true
+    [ -n "${POSTGRES_PID:-}" ] && kill -KILL "$POSTGRES_PID" >/dev/null 2>&1 || true
+    [ -n "${PGMONETA_PID:-}" ] && wait "$PGMONETA_PID" 2>/dev/null || true
+    [ -n "${POSTGRES_PID:-}" ] && wait "$POSTGRES_PID" 2>/dev/null || true
+}
+
+## ================================
+## Test suite operations
+## ================================
+build_test_suite() {
+    echo "Building test suite container..."
     cd "$TEST_SUITE_DIR"
-    make run-default
+    build_composed_image
     cd "$SCRIPT_DIR"
 }
+
+check_port() {
+    local port="$1"
+    if nc -z localhost "$port" 2>/dev/null; then
+        echo "Error: Port $port is already in use. Stop the process using it or change the port configuration"
+        exit 1
+    fi
+}
+
+wait_for_pgmoneta_startup() {
+    ci_wait_for_pgmoneta
+}
+
 
 remove_target_directory_if_exists() {
     local target_dir="$SCRIPT_DIR/../target"
@@ -106,23 +363,30 @@ cleanup() {
     echo "Cleaning up test suite environment..."
     remove_target_directory_if_exists
     cd "$TEST_SUITE_DIR"
-    make clean
+    get_image_name
+    clean_composed_image
     cd "$SCRIPT_DIR"
 }
 
 install_dependencies() {
     echo "Installing dependencies..."
-    sudo dnf update -y
-    sudo dnf install -y cargo make
+    dnf update -y
+    dnf install -y cargo # currently we just need cargo to run pgmoneta-mcp, others are installed in the ci or by docker/podman
 }
 
+## ================================
+## Main script logic
+## ================================
 usage() {
    echo "Usage: $0 [options] [sub-command]"
    echo "Subcommands:"
-   echo " setup          Install Dependencies e.g (Rust, Cargo and Make) required for building and running tests"
+   echo " setup          Install Dependencies e.g (Rust, Cargo) required for building and running tests"
    echo " build          Set up environment (build, postgreSQL and pgmoneta composed image) without running tests"
    echo " clean          Clean up test suite environment and remove the composed image"
-   echo " test           Build image and run full test suite (clean + build + test)"
+   echo " test           Starts the composed container and run full test suite (clean + build + test)"
+   echo " integration    Starts the composed container and run only integration tests (clean + build + integration)"
+   echo " unit           Starts the composed container and run only unit tests (clean + build + unit)"
+   echo " ci             Run full test suite with CI-specific settings"
    echo "Options (run tests with optional filter; default is full suite):"
    echo " -m, --module NAME   Run all tests in module NAME"
    echo "Examples:"
@@ -130,98 +394,139 @@ usage() {
    echo "  $0 test             Run full test suite"
    echo "  $0 build            Set up environment only; then run e.g. $0 test -m security"
    echo "  $0 test -m security       Run all tests in module 'security'"
+   echo "  $0 integration -m info_test    Run integration tests in module 'info_test'"
    exit 1
 }
 
-main() {
-    MODULE_FILTER=""
-    SUBCOMMAND=""
-    while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -m|--module)
-            shift
-            [[ $# -eq 0 ]] && { echo "Error: -m/--module requires NAME"; usage; }
-            MODULE_FILTER="$1"
-            shift
-            ;;
-        setup)
-            [[ -n "$SUBCOMMAND" ]] && usage
-            SUBCOMMAND="setup"
-            shift
-            ;;
-        build)
-            [[ -n "$SUBCOMMAND" ]] && usage
-            SUBCOMMAND="build"
-            shift
-            ;;
-        clean)
-            [[ -n "$SUBCOMMAND" ]] && usage
-            SUBCOMMAND="clean"
-            shift
-            ;;
-        test)
-            [[ -n "$SUBCOMMAND" ]] && usage
-            SUBCOMMAND="test"
-            shift
-            ;;
-        -h|--help)
-            usage
-            ;;
-        -*)
-            echo "Invalid option: $1"
-            usage
-            ;;
-        *)
-            echo "Invalid parameter: $1"
-            usage
-            ;;
-    esac
-    done
-
-    if [[ -n "$MODULE_FILTER" ]] && [[ -n "$SUBCOMMAND" ]] && [[ "$SUBCOMMAND" != "test" ]]; then
-        echo "Error: -m/--module option can only be used with 'test' subcommand or no subcommand"
+MODULE_FILTER=""
+SUBCOMMAND=""
+while [[ $# -gt 0 ]]; do
+case "$1" in
+    -m|--module)
+        shift
+        [[ $# -eq 0 ]] && { echo "Error: -m/--module requires NAME"; usage; }
+        MODULE_FILTER="$1"
+        shift
+        ;;
+    setup)
+        [[ -n "$SUBCOMMAND" ]] && usage
+        SUBCOMMAND="setup"
+        shift
+        ;;
+    build)
+        [[ -n "$SUBCOMMAND" ]] && usage
+        SUBCOMMAND="build"
+        shift
+        ;;
+    clean)
+        [[ -n "$SUBCOMMAND" ]] && usage
+        SUBCOMMAND="clean"
+        shift
+        ;;
+    test)
+        [[ -n "$SUBCOMMAND" ]] && usage
+        SUBCOMMAND="test"
+        shift
+        ;;
+    integration)
+        [[ -n "$SUBCOMMAND" ]] && usage
+        SUBCOMMAND="integration"
+        shift
+        ;;
+    unit)
+        [[ -n "$SUBCOMMAND" ]] && usage
+        SUBCOMMAND="unit"
+        shift
+        ;;
+    ci)
+        [[ -n "$SUBCOMMAND" ]] && usage
+        SUBCOMMAND="ci"
+        shift
+        ;;
+    -h|--help)
         usage
-    fi
+        ;;
+    -*)
+        echo "Invalid option: $1"
+        usage
+        ;;
+    *)
+        echo "Invalid parameter: $1"
+        usage
+        ;;
+esac
+done
 
-    if [[ "$SUBCOMMAND" == "setup" ]]; then 
-        install_dependencies
-        echo "Dependencies installed."
-        exit 0
-    fi
-    if [[ "$SUBCOMMAND" == "build" ]]; then
-        setup_master_key
-        copy_master_key
-        build_test_suite
-        echo "Test suite environment set up."
-        exit 0
-    fi
-    if [[ "$SUBCOMMAND" == "clean" ]]; then
-        cleanup
-        echo "Test suite environment cleaned."
-        exit 0
-    fi
-    if [[ "$SUBCOMMAND" == "test" ]]; then
-        start_composed_container
-        if [[ -n "$MODULE_FILTER" ]]; then
-            cargo test -- --test-threads=1 --nocapture -- $MODULE_FILTER
-        else 
-            cargo test -- --test-threads=1 --nocapture
-        fi
-        exit 0
-    fi
-    if [[ -z "$SUBCOMMAND" ]]; then
-        cleanup
-        setup_master_key
-        copy_master_key
-        build_test_suite
-        start_composed_container
-        if [[ -n "$MODULE_FILTER" ]]; then
-            cargo test -- --test-threads=1 --nocapture -- $MODULE_FILTER
-        else 
-            cargo test -- --test-threads=1 --nocapture
-        fi
-        exit 0
-    fi
-}
+if [[ -n "$MODULE_FILTER" ]] && [[ -n "$SUBCOMMAND" ]] && \
+    [[ "$SUBCOMMAND" != "test" ]] && [[ "$SUBCOMMAND" != "integration" ]] && [[ "$SUBCOMMAND" != "unit" ]]; then
+    echo "Error: -m/--module option can only be used with 'test', 'integration', or 'unit' subcommands, or no subcommand"
+    usage
+fi
 
-main "$@"
+if [[ "$SUBCOMMAND" == "setup" ]]; then 
+    install_dependencies
+    echo "Dependencies installed."
+    exit 0
+fi
+if [[ "$SUBCOMMAND" == "build" ]]; then
+    handle_master_key
+    build_test_suite
+    echo "Test suite environment set up."
+    exit 0
+fi
+if [[ "$SUBCOMMAND" == "clean" ]]; then
+    cleanup
+    echo "Test suite environment cleaned."
+    exit 0
+fi
+if [[ "$SUBCOMMAND" == "test" ]]; then
+    handle_master_key
+    build_test_suite
+    start_composed_container
+    trap stop_composed_container EXIT
+    if [[ -n "$MODULE_FILTER" ]]; then
+        cargo test --all-features -- --test-threads=1 --nocapture -- $MODULE_FILTER
+    else 
+        cargo test --all-features -- --test-threads=1 --nocapture
+    fi
+    exit 0
+fi
+if [[ "$SUBCOMMAND" == "integration" ]]; then
+    handle_master_key
+    build_test_suite
+    start_composed_container
+    trap stop_composed_container EXIT
+    if [[ -n "$MODULE_FILTER" ]]; then
+        cargo test --test "*" -- --test-threads=1 --nocapture -- $MODULE_FILTER
+    else 
+        cargo test --test "*" -- --test-threads=1 --nocapture
+    fi
+    exit 0
+fi
+if [[ "$SUBCOMMAND" == "unit" ]]; then
+    if [[ -n "$MODULE_FILTER" ]]; then
+        cargo test --lib -- --test-threads=1 --nocapture -- $MODULE_FILTER
+    else 
+        cargo test --lib -- --test-threads=1 --nocapture
+    fi
+    exit 0
+fi
+if [[ "$SUBCOMMAND" == "ci" ]]; then
+    trap ci_shutdown EXIT
+    ci_setup
+    cargo test -- --test-threads=1 --nocapture
+    exit 0
+fi
+if [[ -z "$SUBCOMMAND" ]]; then
+    cleanup
+    handle_master_key
+    build_test_suite
+    start_composed_container
+    trap stop_composed_container EXIT
+    if [[ -n "$MODULE_FILTER" ]]; then
+        cargo test -- --test-threads=1 --nocapture -- $MODULE_FILTER
+    else 
+        cargo test -- --test-threads=1 --nocapture
+    fi
+    exit 0
+fi

@@ -39,7 +39,7 @@ jobs:
       with:
         command: check
 
-  test:
+  unit-test:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -53,6 +53,7 @@ jobs:
       uses: actions-rs/cargo@v1
       with:
         command: test
+        args: --lib 
 
   lint:
     runs-on: ubuntu-latest
@@ -70,3 +71,25 @@ jobs:
       with:
         command: clippy
         args: -- -D warnings # Treat clippy warnings as errors
+
+  full-test:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/rockylinux/rockylinux:10
+      options: --privileged -v /var/run/docker.sock:/var/run/docker.sock
+    steps:
+    - uses: actions/checkout@v4
+    - name: Run integration tests
+      run: |
+        set -o pipefail
+        mkdir -p /tmp/pgmoneta-test/log
+        chmod u+x ./test/check.sh
+        ./test/check.sh ci 2>&1 | tee /tmp/pgmoneta-test/log/test.log
+
+    - name: Upload full logs
+      if: always()
+      uses: actions/upload-artifact@v5
+      with:
+        name: full-logs
+        path: /tmp/pgmoneta-test/log/test.log
+        if-no-files-found: ignore
