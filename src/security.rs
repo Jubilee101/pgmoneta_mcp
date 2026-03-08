@@ -21,10 +21,12 @@ use base64::{
     Engine as _, alphabet,
     engine::{self, general_purpose},
 };
+use hmac::Hmac;
 use home::home_dir;
+use pbkdf2::pbkdf2;
 use rand::TryRngCore;
 use scram::ScramClient;
-use scrypt::{Params, scrypt};
+use sha2::Sha256;
 use std::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -32,6 +34,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const NONCE_LEN: usize = 12;
 const SALT_LEN: usize = 16;
+const PBKDF2_ITERATIONS: u32 = 600_000;
 const MAX_CIPHERTEXT_B64_LEN: usize = 1024 * 1024;
 
 pub struct SecurityUtil {
@@ -173,10 +176,9 @@ impl SecurityUtil {
         Ok(msg)
     }
     fn derive_key(master_key: &[u8], salt: &[u8]) -> anyhow::Result<[u8; 32]> {
-        let params = Params::recommended();
         let mut derived_key = [0u8; 32];
-        scrypt(master_key, salt, &params, &mut derived_key)
-            .map_err(|e| anyhow!("scrypt failed: {:?}", e))?;
+        pbkdf2::<Hmac<Sha256>>(master_key, salt, PBKDF2_ITERATIONS, &mut derived_key)
+            .map_err(|e| anyhow!("PBKDF2 failed: {:?}", e))?;
         Ok(derived_key)
     }
 

@@ -12,6 +12,7 @@ Jesper Pedersen <jesperpedersen.db@gmail.com>
 Ahmed Kamal <ahmedkamal200427@gmail.com>
 Induwara Gunasena <induwaragunasena.sl@gmail.com>
 Noor Amjad <xdjust18@gmail.com>
+Trevor Jacob Mathews <trevorjacobmathews@gmail.com>
 ```
 
 ## Committers
