@@ -1,10 +1,12 @@
 name: RPM Build
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason'
+        required: true
+        default: 'Release'
 
 jobs:
   build-rpm:
