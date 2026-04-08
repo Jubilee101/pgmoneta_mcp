@@ -34,7 +34,7 @@ See the manual or [LOCAL_LLM.md](LOCAL_LLM.md) for detailed setup instructions.
 
 | Property | Default | Unit | Required | Description |
 | :------- | :------ | :--- | :------- | :---------- |
-| provider | | String | Yes | The local LLM backend (`ollama` or `llama.cpp`) |
+| provider | | String | Yes | The local LLM backend (`ollama`, `llama.cpp` or `ramalama`) |
 | endpoint | | String | Yes | The URL of the LLM inference server |
 | model | | String | Yes | The model name to use for inference |
 | max_tool_rounds | 10 | Int | No | Maximum tool-calling iterations per user prompt |

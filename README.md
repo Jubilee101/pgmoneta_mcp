@@ -23,6 +23,7 @@ LLMs
 
 * [Ollama](https://ollama.com)
 * [llama.cpp](https://github.com/ggml-org/llama.cpp)
+* [ramalama](https://ramalama.ai/)
 
 Models
 
