@@ -16,6 +16,7 @@
 pub mod conf;
 pub mod hello;
 pub mod info;
+pub mod mode;
 pub mod retention;
 pub mod shutdown;
 
@@ -59,6 +60,7 @@ impl PgmonetaHandler {
             .with_async_tool::<conf::ConfLsTool>()
             .with_async_tool::<conf::ConfGetTool>()
             .with_async_tool::<conf::ConfSetTool>()
+            .with_async_tool::<mode::SetModeTool>()
     }
 }
 

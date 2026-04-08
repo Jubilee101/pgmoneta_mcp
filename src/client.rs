@@ -15,6 +15,7 @@
 
 mod conf;
 mod info;
+mod mode;
 mod retention;
 mod shutdown;
 
