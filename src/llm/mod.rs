@@ -20,7 +20,7 @@ pub use ollama::OllamaClient;
 pub use openai::OpenAiClient;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 /// Represents a single message in the conversation history.
@@ -121,16 +121,55 @@ pub fn mcp_tools_to_llm_schema(tools: &[rmcp::model::Tool]) -> Vec<ToolDefinitio
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: tool.name.to_string(),
-                description: tool
-                    .description
-                    .as_ref()
-                    .map(|d| d.to_string())
-                    .unwrap_or_default(),
-                parameters: serde_json::to_value(&*tool.input_schema)
-                    .unwrap_or(Value::Object(serde_json::Map::new())),
+                description: sanitize_tool_description(
+                    &tool
+                        .description
+                        .as_ref()
+                        .map(|d| d.to_string())
+                        .unwrap_or_default(),
+                ),
+                parameters: sanitize_tool_parameters(
+                    serde_json::to_value(&*tool.input_schema)
+                        .unwrap_or(Value::Object(serde_json::Map::new())),
+                ),
             },
         })
         .collect()
+}
+
+fn sanitize_tool_description(description: &str) -> String {
+    description
+        .replace(
+            " The username has to be one of the pgmoneta admins to be able to access pgmoneta.",
+            "",
+        )
+        .replace(
+            " The username has to be one of the pgmoneta admins to be able to perform this action.",
+            "",
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sanitize_tool_parameters(parameters: Value) -> Value {
+    let Value::Object(mut schema) = parameters else {
+        return parameters;
+    };
+
+    if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+        properties.remove("username");
+    }
+
+    if let Some(Value::Array(required)) = schema.get_mut("required") {
+        required.retain(|value| value.as_str() != Some("username"));
+    }
+
+    schema
+        .entry("properties".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+
+    Value::Object(schema)
 }
 
 impl ChatMessage {
@@ -182,5 +221,71 @@ impl ChatMessage {
             tool_calls: None,
             tool_name: Some(tool_name.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::PgmonetaHandler;
+    use serde_json::json;
+
+    #[test]
+    fn test_sanitize_tool_description_removes_username_boilerplate() {
+        assert_eq!(
+            sanitize_tool_description(
+                "List backups of a server. The username has to be one of the pgmoneta admins to be able to access pgmoneta."
+            ),
+            "List backups of a server."
+        );
+        assert_eq!(
+            sanitize_tool_description(
+                "Shutdown the pgmoneta server. The username has to be one of the pgmoneta admins to be able to perform this action. Note: After pgmoneta is shut down, subsequent backup-related tool calls will fail until pgmoneta is restarted."
+            ),
+            "Shutdown the pgmoneta server. Note: After pgmoneta is shut down, subsequent backup-related tool calls will fail until pgmoneta is restarted."
+        );
+    }
+
+    #[test]
+    fn test_sanitize_tool_parameters_removes_username() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": "string" },
+                "username": { "type": "string" }
+            },
+            "required": ["server", "username"]
+        });
+
+        assert_eq!(
+            sanitize_tool_parameters(schema),
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "required": ["server"]
+            })
+        );
+    }
+
+    #[test]
+    fn test_mcp_tools_to_llm_schema_hides_injected_username() {
+        let tools = PgmonetaHandler::tool_router().list_all();
+        let schemas = mcp_tools_to_llm_schema(&tools);
+        let list_backups = schemas
+            .iter()
+            .find(|tool| tool.function.name == "list_backups")
+            .expect("list_backups tool should exist");
+
+        assert!(!list_backups.function.description.contains("username"));
+        assert_eq!(
+            list_backups.function.parameters["properties"].get("username"),
+            None
+        );
+        assert_eq!(
+            list_backups.function.parameters["required"],
+            json!(["server"])
+        );
     }
 }

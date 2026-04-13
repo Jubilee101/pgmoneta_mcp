@@ -52,7 +52,7 @@ Always select the single best matching tool from the provided tool list and resp
 Use arguments that are explicitly provided by the user and match the tool schema. \
 Do not invent values. Omit optional arguments when the user did not specify them. \
 If the user mentions a pgmoneta server name such as primary or standby, pass it through the tool's `server` argument. \
-Requests to back up a server, such as `Backup primary server`, should call the `backup_server` tool.";
+Requests to backup a server, such as `Backup primary server` will call the `backup_server` tool.";
 const HELP_TEXT: &str = "\
 Basic usage:
   /help                 Show this help
@@ -61,10 +61,9 @@ Basic usage:
   /tools                List available MCP tools
   /exit or /quit        Exit the client
 
-The client injects `username` from the users file automatically and derives the
-tool `server` argument from the configured MCP endpoint host. If other arguments
-are omitted in user mode, the client prompts from the tool schema and lets you
-skip optional values.
+The client injects `username` from the users file automatically.
+Required tool arguments such as `server` must be provided explicitly. If any
+required arguments are missing, the client reports them before executing.
 
 When an `[llm]` section is configured in `pgmoneta-mcp-client.conf`, you can
 also enter natural-language requests such as `List backups on primary server`.
@@ -710,7 +709,9 @@ fn parse_mode_input(
 ) -> Result<ClientCommand> {
     match mode {
         ClientMode::User => {
-            if llm_enabled {
+            if is_explicit_tool_call(input, available_tools) {
+                parse_tool_call(input)
+            } else if llm_enabled {
                 Ok(ClientCommand::NaturalLanguage(input.to_string()))
             } else {
                 Err(anyhow!(
@@ -795,7 +796,7 @@ fn select_username(users_path: &str) -> Result<String> {
 fn execute_tool_command(
     runtime: &Runtime,
     client: &McpClient,
-    editor: &mut ClientEditor,
+    _editor: &mut ClientEditor,
     tools: &[Tool],
     defaults: &ClientDefaults,
     mode: ClientMode,
@@ -812,15 +813,13 @@ fn execute_tool_command(
         ClientMode::Developer => args,
     };
     let args = apply_tool_defaults(&tool.input_schema, args, defaults);
-    let args = match mode {
-        ClientMode::User => {
-            let Some(args) = prompt_for_missing_arguments(editor, tool, args)? else {
-                return Ok(());
-            };
-            args
+    if mode == ClientMode::User {
+        let missing = missing_required_arguments(&tool.input_schema, &args);
+        if !missing.is_empty() {
+            println!("{}", format_missing_required_arguments(&missing));
+            return Ok(());
         }
-        ClientMode::Developer => args,
-    };
+    }
 
     match runtime.block_on(client.call_tool(name, args)) {
         Ok(result) => match mode {
@@ -868,10 +867,6 @@ fn apply_tool_defaults(
         return args;
     };
 
-    if properties.contains_key("server") && !args.contains_key("server") {
-        args.insert("server".to_string(), Value::String(defaults.server.clone()));
-    }
-
     if properties.contains_key("username") {
         args.insert(
             "username".to_string(),
@@ -880,6 +875,37 @@ fn apply_tool_defaults(
     }
 
     args
+}
+
+fn missing_required_arguments(
+    schema: &serde_json::Map<String, Value>,
+    args: &HashMap<String, Value>,
+) -> Vec<String> {
+    let mut missing: Vec<String> = required_argument_set(schema)
+        .into_iter()
+        .filter(|name| is_missing_required_argument(args.get(name)))
+        .collect();
+    missing.sort();
+    missing
+}
+
+fn is_missing_required_argument(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => true,
+        Some(Value::String(text)) => {
+            let trimmed = text.trim();
+            trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null")
+        }
+        _ => false,
+    }
+}
+
+fn format_missing_required_arguments(missing: &[String]) -> String {
+    match missing {
+        [] => String::new(),
+        [name] => format!("Missing {name} definition"),
+        _ => format!("Missing definitions: {}", missing.join(", ")),
+    }
 }
 
 fn tool_server_from_endpoint(server: &str) -> Result<String> {
@@ -931,76 +957,6 @@ async fn translate_natural_language<L: LlmClient>(
     }
 }
 
-fn prompt_for_missing_arguments(
-    editor: &mut ClientEditor,
-    tool: &Tool,
-    mut args: HashMap<String, Value>,
-) -> Result<Option<HashMap<String, Value>>> {
-    let Some(properties) = tool
-        .input_schema
-        .get("properties")
-        .and_then(Value::as_object)
-    else {
-        return Ok(Some(args));
-    };
-
-    for name in prompt_argument_names(&tool.input_schema, &args) {
-        let schema = properties.get(&name).ok_or_else(|| {
-            anyhow!(
-                "Tool schema missing property '{}' for '{}'",
-                name,
-                tool.name
-            )
-        })?;
-        let required = is_required_argument(&tool.input_schema, &name);
-
-        loop {
-            let prompt = build_argument_prompt(&name, schema, required);
-            let line = match editor.readline(&prompt) {
-                Ok(line) => line,
-                Err(ReadlineError::Interrupted) => {
-                    println!();
-                    return Ok(None);
-                }
-                Err(ReadlineError::Eof) => {
-                    println!();
-                    return Ok(None);
-                }
-                Err(e) => return Err(anyhow!("Failed to read argument '{}': {}", name, e)),
-            };
-
-            let line = line.trim();
-            if line.is_empty() && !required {
-                break;
-            }
-
-            match parse_prompt_value(&name, line, schema, required) {
-                Ok(value) => {
-                    args.insert(name.clone(), value);
-                    break;
-                }
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                }
-            }
-        }
-    }
-
-    Ok(Some(args))
-}
-
-fn prompt_argument_names(
-    schema: &serde_json::Map<String, Value>,
-    args: &HashMap<String, Value>,
-) -> Vec<String> {
-    let mut names: Vec<String> = required_argument_set(schema)
-        .into_iter()
-        .filter(|name| !args.contains_key(name))
-        .collect();
-    names.sort();
-    names
-}
-
 fn required_argument_set(schema: &serde_json::Map<String, Value>) -> HashSet<String> {
     schema
         .get("required")
@@ -1010,69 +966,6 @@ fn required_argument_set(schema: &serde_json::Map<String, Value>) -> HashSet<Str
         .filter_map(Value::as_str)
         .map(ToOwned::to_owned)
         .collect()
-}
-
-fn is_required_argument(schema: &serde_json::Map<String, Value>, name: &str) -> bool {
-    required_argument_set(schema).contains(name)
-}
-
-fn build_argument_prompt(name: &str, schema: &Value, required: bool) -> String {
-    let value_type = schema
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("value");
-    let description = schema
-        .get("description")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|desc| !desc.is_empty());
-    let requirement = if required { "required" } else { "optional" };
-
-    match description {
-        Some(description) => format!("{name} [{value_type}, {requirement}] - {description}: "),
-        None => format!("{name} [{value_type}, {requirement}]: "),
-    }
-}
-
-fn parse_prompt_value(name: &str, raw: &str, schema: &Value, required: bool) -> Result<Value> {
-    if raw.is_empty() && required {
-        bail!("Required argument '{}' cannot be empty", name);
-    }
-
-    let value_type = schema.get("type").and_then(Value::as_str);
-
-    match value_type {
-        Some("string") => Ok(Value::String(raw.to_string())),
-        Some("integer") => {
-            let value: Value = serde_json::from_str(raw)
-                .with_context(|| format!("Argument '{}' must be an integer", name))?;
-            match value {
-                Value::Number(number) if number.is_i64() || number.is_u64() => {
-                    Ok(Value::Number(number))
-                }
-                _ => Err(anyhow!("Argument '{}' must be an integer", name)),
-            }
-        }
-        Some("number") => {
-            let value: Value = serde_json::from_str(raw)
-                .with_context(|| format!("Argument '{}' must be a number", name))?;
-            match value {
-                Value::Number(number) => Ok(Value::Number(number)),
-                _ => Err(anyhow!("Argument '{}' must be a number", name)),
-            }
-        }
-        Some("boolean") => {
-            let value: Value = serde_json::from_str(raw)
-                .with_context(|| format!("Argument '{}' must be true or false", name))?;
-            match value {
-                Value::Bool(boolean) => Ok(Value::Bool(boolean)),
-                _ => Err(anyhow!("Argument '{}' must be true or false", name)),
-            }
-        }
-        Some("object") | Some("array") => serde_json::from_str(raw)
-            .with_context(|| format!("Argument '{}' must be valid JSON", name)),
-        _ => Ok(serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))),
-    }
 }
 
 fn prompt_target_from_url(url: &str, username: &str) -> Result<String> {
@@ -1109,7 +1002,7 @@ fn format_tools(tools: &[Tool]) -> String {
     let mut entries: Vec<&Tool> = tools.iter().collect();
     entries.sort_by_key(|tool| tool.name.to_string());
 
-    let mut lines = vec!["Available tools:".to_string()];
+    let mut lines = vec![tools_intro().to_string()];
     for tool in entries {
         let description = tool
             .description
@@ -1126,6 +1019,10 @@ fn format_tools(tools: &[Tool]) -> String {
     }
 
     lines.join("\n")
+}
+
+fn tools_intro() -> &'static str {
+    "Available tools:\n"
 }
 
 fn sanitize_tool_description(description: &str) -> String {
@@ -1324,6 +1221,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_tool_calls_in_user_mode() {
+        let tools = HashSet::from(["list_backups".to_string()]);
+
+        assert_eq!(
+            parse_input(
+                r#"list_backups {"server":"primary"}"#,
+                &tools,
+                true,
+                ClientMode::User
+            )
+            .unwrap(),
+            ClientCommand::ToolCall {
+                name: "list_backups".to_string(),
+                args: HashMap::from([("server".to_string(), json!("primary"))]),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_calls_in_user_mode_without_llm() {
+        let tools = HashSet::from(["list_backups".to_string()]);
+
+        assert_eq!(
+            parse_input(
+                r#"list_backups {"server":"primary"}"#,
+                &tools,
+                false,
+                ClientMode::User
+            )
+            .unwrap(),
+            ClientCommand::ToolCall {
+                name: "list_backups".to_string(),
+                args: HashMap::from([("server".to_string(), json!("primary"))]),
+            }
+        );
+    }
+
+    #[test]
     fn test_parse_tool_call_rejects_non_object_args() {
         let tools = HashSet::from(["info".to_string()]);
         let err = parse_input("info []", &tools, false, ClientMode::Developer).unwrap_err();
@@ -1375,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_tool_defaults_injects_server_and_username() {
+    fn test_apply_tool_defaults_injects_username_only() {
         let schema = serde_json::from_value(json!({
             "properties": {
                 "server": { "type": "string" },
@@ -1391,9 +1326,9 @@ mod tests {
         };
 
         let args = apply_tool_defaults(&schema, args, &defaults);
-        assert_eq!(args.get("server").unwrap(), "primary");
         assert_eq!(args.get("username").unwrap(), "admin");
         assert_eq!(args.get("backup_id").unwrap(), "latest");
+        assert!(!args.contains_key("server"));
     }
 
     #[test]
@@ -1417,6 +1352,47 @@ mod tests {
         let args = apply_tool_defaults(&schema, args, &defaults);
         assert_eq!(args.get("server").unwrap(), "primary");
         assert_eq!(args.get("username").unwrap(), "admin");
+    }
+
+    #[test]
+    fn test_missing_required_arguments_reports_missing_server() {
+        let schema = serde_json::from_value(json!({
+            "properties": {
+                "server": { "type": "string" },
+                "username": { "type": "string" }
+            },
+            "required": ["server", "username"]
+        }))
+        .unwrap();
+        let args = HashMap::from([("username".to_string(), json!("admin"))]);
+
+        assert_eq!(missing_required_arguments(&schema, &args), vec!["server"]);
+        assert_eq!(
+            format_missing_required_arguments(&missing_required_arguments(&schema, &args)),
+            "Missing server definition"
+        );
+    }
+
+    #[test]
+    fn test_missing_required_arguments_reports_multiple_missing_fields() {
+        let schema = serde_json::from_value(json!({
+            "properties": {
+                "server": { "type": "string" },
+                "backup_id": { "type": "string" }
+            },
+            "required": ["server", "backup_id"]
+        }))
+        .unwrap();
+        let args = HashMap::new();
+
+        assert_eq!(
+            missing_required_arguments(&schema, &args),
+            vec!["backup_id", "server"]
+        );
+        assert_eq!(
+            format_missing_required_arguments(&missing_required_arguments(&schema, &args)),
+            "Missing definitions: backup_id, server"
+        );
     }
 
     #[test]
@@ -1487,63 +1463,6 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_argument_names_only_returns_missing_required_fields() {
-        let schema = serde_json::from_value(json!({
-            "properties": {
-                "sort": { "type": "string" },
-                "username": { "type": "string" },
-                "server": { "type": "string" }
-            },
-            "required": ["username", "server"]
-        }))
-        .unwrap();
-        let args = HashMap::from([("username".to_string(), json!("admin"))]);
-
-        assert_eq!(prompt_argument_names(&schema, &args), vec!["server"]);
-    }
-
-    #[test]
-    fn test_prompt_argument_names_handles_tools_without_properties() {
-        let schema = serde_json::Map::new();
-        let args = HashMap::new();
-
-        assert!(prompt_argument_names(&schema, &args).is_empty());
-    }
-
-    #[test]
-    fn test_parse_prompt_value_for_string_and_integer() {
-        assert_eq!(
-            parse_prompt_value("username", "admin", &json!({"type": "string"}), true).unwrap(),
-            json!("admin")
-        );
-        assert_eq!(
-            parse_prompt_value("port", "8000", &json!({"type": "integer"}), true).unwrap(),
-            json!(8000)
-        );
-    }
-
-    #[test]
-    fn test_parse_prompt_value_rejects_empty_and_invalid_boolean() {
-        let err = parse_prompt_value("username", "", &json!({"type": "string"}), true).unwrap_err();
-        assert!(err.to_string().contains("cannot be empty"));
-
-        let err =
-            parse_prompt_value("force", "yes", &json!({"type": "boolean"}), true).unwrap_err();
-        assert!(err.to_string().contains("true or false"));
-    }
-
-    #[test]
-    fn test_build_argument_prompt_marks_required_and_optional() {
-        assert!(
-            build_argument_prompt("username", &json!({"type": "string"}), true)
-                .contains("required")
-        );
-        assert!(
-            build_argument_prompt("sort", &json!({"type": "string"}), false).contains("optional")
-        );
-    }
-
-    #[test]
     fn test_prompt_target_from_url_formats_user_and_url_target() {
         assert_eq!(
             prompt_target_from_url("http://localhost:8080/mcp", "admin").unwrap(),
@@ -1580,6 +1499,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(format_tool_arguments(&schema), "(backup?, server)");
+    }
+
+    #[test]
+    fn test_tools_intro_mentions_automatic_username_injection() {
+        assert_eq!(tools_intro(), "Available tools:\n");
     }
 
     #[test]
