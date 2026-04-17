@@ -38,16 +38,12 @@ use serde_json::Value;
 /// This struct routes MCP tool calls from the client (like an AI model)
 /// to the appropriate internal functions that communicate with pgmoneta.
 #[derive(Clone)]
-pub struct PgmonetaHandler {
-    tool_router: ToolRouter<PgmonetaHandler>,
-}
+pub struct PgmonetaHandler;
 
 impl PgmonetaHandler {
     /// Creates a new instance of the `PgmonetaHandler` with an initialized tool router.
     pub fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
+        Self
     }
 
     /// Builds the tool router by registering each tool via the trait-based API.
